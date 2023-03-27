@@ -11,6 +11,8 @@ using System.Text;
 using Microsoft.IdentityModel.Tokens;
 using System.Security.Claims;
 using Newtonsoft.Json;
+using UserApi.Interfaces;
+using Microsoft.AspNetCore.Authorization;
 
 namespace UserApi.Controllers
 {
@@ -20,13 +22,15 @@ namespace UserApi.Controllers
     public class UserController : ControllerBase
     {
 
-        private readonly NodeContext NodeDbContext;
+        //    private readonly NodeContext NodeDbContext;
         private readonly IConfiguration Configuration;
 
-        public UserController(NodeContext nodeContext, IConfiguration configuration)
+        private readonly IUser _IUser;
+
+        public UserController(NodeContext nodeContext, IConfiguration configuration, IUser user)
         {
-            this.NodeDbContext = nodeContext;
             this.Configuration = configuration;
+            this._IUser = user;
         }
 
         [HttpPost(Name = "Register")]
@@ -38,7 +42,7 @@ namespace UserApi.Controllers
                 {
                     return BadRequest("Please provide all the inputs");
                 }
-                var User = NodeDbContext.Users.FirstOrDefault(o => register.username.Equals(o.Username) || register.email.Equals(o.Email));
+                var User = this._IUser.GetUser(register.username);
                 if (User == null)
                 {
                     User = new User();
@@ -46,9 +50,8 @@ namespace UserApi.Controllers
                     User.Email = register.email;
                     var password = BCrypt.Net.BCrypt.HashPassword(register.password, 10);
                     User.Password = password;
-                    this.NodeDbContext.Users.Add(User);
-                    this.NodeDbContext.SaveChanges();
-                    User = NodeDbContext.Users.FirstOrDefault(o => register.username.Equals(o.Username) || register.email.Equals(o.Email));
+                    User = this._IUser.RegisterUser(User);
+
                     if (User != null)
                     {
                         User.Password = "";
@@ -84,7 +87,7 @@ namespace UserApi.Controllers
                 {
                     return BadRequest("Please provide all the inputs");
                 }
-                var User = NodeDbContext.Users.FirstOrDefault(o => login.Username.Equals(o.Username) || login.Username.Equals(o.Email));
+                var User = this._IUser.GetUser(login.Username);
                 if (User != null)
                 {
                     var match = BCrypt.Net.BCrypt.Verify(login.Password, User.Password);
@@ -95,7 +98,7 @@ namespace UserApi.Controllers
                     }
                     else
                     {
-                        return Unauthorized();
+                        return Unauthorized("Invalid username or password");
                     }
 
 
@@ -114,6 +117,7 @@ namespace UserApi.Controllers
             }
 
         }
+        [Authorize]
         [HttpGet("{username}")]
         public IActionResult Get(string username)
         {
@@ -122,22 +126,14 @@ namespace UserApi.Controllers
                 var re = Request;
                 var headers = re.Headers;
                 var token = headers["Authorization"].FirstOrDefault()?.Split(" ").Last();
-                Boolean validated = validateJwtToken(token);
-                if (validated)
+                var user = this._IUser.GetUser(username);
+                if (user != null)
                 {
-                    var user = this.NodeDbContext.Users.FirstOrDefault(o => username.Equals(o.Username) || username.Equals(o.Email));
-                    if (user != null)
-                    {
-                        return Ok(user);
-                    }
-                    else
-                    {
-                        return NotFound("User not found");
-                    }
+                    return Ok(user);
                 }
                 else
                 {
-                    return Unauthorized();
+                    return NotFound("User not found");
                 }
             }
             catch (Exception ex)
@@ -147,6 +143,7 @@ namespace UserApi.Controllers
                 return new StatusCodeResult(StatusCodes.Status500InternalServerError);
             }
         }
+        [Authorize]
         [HttpGet(Name = "GetUserDetails")]
         public IActionResult Get()
         {
@@ -156,26 +153,25 @@ namespace UserApi.Controllers
                 var headers = re.Headers;
                 var token = headers["Authorization"].FirstOrDefault()?.Split(" ").Last();
 
-                Boolean validated = validateJwtToken(token);
-                if (validated)
+                var userDetails = headers["user"].FirstOrDefault()?.Split(" ").Last();
+                var claimsIdentity = this.User.Identity as ClaimsIdentity;
+                if (claimsIdentity != null)
                 {
-                    var userDetails = headers["user"].FirstOrDefault()?.Split(" ").Last();
-                    var user = JsonConvert.DeserializeObject<User>(userDetails);
-                    //var user = this.NodeDbContext.Users.FirstOrDefault(o => username.Equals(o.Username) || username.Equals(o.Email));
 
-                    if (user != null)
+                    var userId = claimsIdentity.FindFirst(ClaimTypes.Name)?.Value;
+                    System.Console.WriteLine(claimsIdentity);
+                    System.Console.WriteLine(userId);
+                    if (!string.IsNullOrEmpty(userId))
                     {
-                        return Ok(user);
-                    }
-                    else
-                    {
-                        return NotFound("User not found");
+                        var userIdInt = Int32.Parse(userId);
+                        var user = this._IUser.GetUser(userIdInt);
+                        if (user != null)
+                        {
+                            return Ok(user);
+                        }
                     }
                 }
-                else
-                {
-                    return Unauthorized();
-                }
+                return NotFound("User not found");
             }
             catch (Exception ex)
             {
@@ -188,7 +184,7 @@ namespace UserApi.Controllers
         [HttpGet("list")]
         public IActionResult GetList()
         {
-            var users = this.NodeDbContext.Users.ToList();
+            var users = this._IUser.GetUsers();
             return Ok(users);
         }
 
@@ -198,7 +194,7 @@ namespace UserApi.Controllers
             var key = Encoding.ASCII.GetBytes(Configuration["Jwt:Key"]);
             var tokenDescriptor = new SecurityTokenDescriptor
             {
-                Subject = new ClaimsIdentity(new[] { new Claim("id", userName.ToString()) }),
+                Subject = new ClaimsIdentity(new[] { new Claim(ClaimTypes.Name, userName.ToString()) }),
                 Expires = DateTime.UtcNow.AddMinutes(10),
                 Issuer = Configuration["Jwt:Issuer"],
                 Audience = Configuration["Jwt:Audience"],
@@ -208,48 +204,48 @@ namespace UserApi.Controllers
             return tokenHandler.WriteToken(token);
         }
 
-        private Boolean validateJwtToken(string token)
-        {
-            Boolean isAuthorized = false;
-            try
-            {
-                var tokenHandler = new JwtSecurityTokenHandler();
-                var key = Encoding.ASCII.GetBytes(Configuration["Jwt:Key"]);
-                tokenHandler.ValidateToken(token, new TokenValidationParameters
-                {
-                    ValidateIssuerSigningKey = true,
-                    IssuerSigningKey = new SymmetricSecurityKey(key),
-                    ValidateIssuer = true,
-                    ValidateAudience = true,
-                    // set clockskew to zero so tokens expire exactly at token expiration time (instead of 5 minutes later)
-                    ClockSkew = TimeSpan.Zero,
-                    ValidIssuer = Configuration["Jwt:Issuer"],
-                    ValidAudience = Configuration["Jwt:Audience"],
-                }, out SecurityToken validatedToken);
-                var jwtToken = (JwtSecurityToken)validatedToken;
-                var UserId = jwtToken.Claims.First(x => x.Type == "id").Value;
-                if (UserId != null)
-                {
-                    int userIdInt = Int32.Parse(UserId);
-                    var user = this.NodeDbContext.Users.FirstOrDefault(o => userIdInt == o.UserId);
-                    if (user != null)
-                    {
-                        var request = Request;
-                        request.Headers.Add("user", JsonConvert.SerializeObject(user));
-                        isAuthorized = true;
-                    }
+        /* private Boolean validateJwtToken(string token)
+         {
+             Boolean isAuthorized = false;
+             try
+             {
+                 var tokenHandler = new JwtSecurityTokenHandler();
+                 var key = Encoding.ASCII.GetBytes(Configuration["Jwt:Key"]);
+                 tokenHandler.ValidateToken(token, new TokenValidationParameters
+                 {
+                     ValidateIssuerSigningKey = true,
+                     IssuerSigningKey = new SymmetricSecurityKey(key),
+                     ValidateIssuer = true,
+                     ValidateAudience = true,
+                     // set clockskew to zero so tokens expire exactly at token expiration time (instead of 5 minutes later)
+                     ClockSkew = TimeSpan.Zero,
+                     ValidIssuer = Configuration["Jwt:Issuer"],
+                     ValidAudience = Configuration["Jwt:Audience"],
+                 }, out SecurityToken validatedToken);
+                 var jwtToken = (JwtSecurityToken)validatedToken;
+                 var UserId = jwtToken.Claims.First(x => x.Type == "id").Value;
+                 if (UserId != null)
+                 {
+                     int userIdInt = Int32.Parse(UserId);
+                     var user = this._IUser.GetUser(userIdInt);
+                     if (user != null)
+                     {
+                         var request = Request;
+                         request.Headers.Add("user", JsonConvert.SerializeObject(user));
+                         isAuthorized = true;
+                     }
 
-                }
-                //System.Console.WriteLine($"jwtToken - {jwtToken} - accountId -{UserId}");
+                 }
+                 //System.Console.WriteLine($"jwtToken - {jwtToken} - accountId -{UserId}");
 
-            }
-            catch (System.Exception ex)
-            {
-                System.Console.WriteLine(ex.ToString());
+             }
+             catch (System.Exception ex)
+             {
+                 System.Console.WriteLine(ex.ToString());
 
-            }
-            return isAuthorized;
-        }
+             }
+             return isAuthorized;
+         }*/
 
     }
 }
